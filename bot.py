@@ -1,0 +1,230 @@
+import asyncio
+import logging
+import aiosqlite
+import aiohttp
+import os
+from bs4 import BeautifulSoup
+from datetime import datetime
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from dotenv import load_dotenv
+
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+VIP_GROUP_ID = int(os.getenv("VIP_GROUP_ID"))
+BULK_GROUP_ID = int(os.getenv("BULK_GROUP_ID"))
+
+# Simple database path for free hosting
+DB_NAME = "bot_database.db"
+
+AUTO_CHECK_INTERVAL = 30 * 60  # 30 minutes
+
+KEYWORDS = [
+    "desi homemade", "indian amateur sex", "real indian couple", "desi phone sex video",
+    "homemade mms india", "indian raw fuck", "desi affair sex", "indian cheating wife",
+    "office affair desi", "real cheating mms", "desi mms leak", "indian leaked sex",
+    "viral mms india", "real mms scandal", "leaked desi couple", "indian wife homemade",
+    "desi bhabhi amateur", "tamil homemade", "hidden cam desi", "real desi sex",
+    "indian wife cheating", "desi bhabhi affair", "hidden affair", "indian mms",
+    "desi scandal", "leaked aunty", "college girl leak", "village mms",
+    "bangladeshi gf", "bangladeshi", "Curvy girl", "Beautiful gf", "Hot gf",
+    "Cute girl", "Cute gf", "Masti"
+]
+
+TARGET_SITES = [
+    "https://www.kamababa.desi/", "https://desixclip.me/tag/desitales2/",
+    "https://kamababa.lol/tag/mmsbaba/", "https://www.hindichudaivideos.com/",
+    "https://www.mydesi2.net/", "https://desixxx.love/",
+    "https://www.eporner.com/cat/all/", "https://www.tamilsexzone.com/",
+    "https://desii49.com/", "https://www.spicymms.com/",
+    "https://area51.porn/", "https://xnxxporn.video/category/desi-sex/"
+]
+
+# ==========================================
+# DATABASE
+# ==========================================
+async def init_db():
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS videos (
+                video_id TEXT PRIMARY KEY,
+                url TEXT,
+                site TEXT,
+                category TEXT,
+                keyword TEXT,
+                sent_to TEXT,
+                timestamp TEXT
+            )
+        """)
+        await db.commit()
+    logging.info("Database initialized.")
+
+async def is_video_exists(url_id: str) -> bool:
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute("SELECT 1 FROM videos WHERE video_id = ?", (url_id,))
+        return await cursor.fetchone() is not None
+
+async def save_video(video_id, url, site, category, keyword, sent_to):
+    async with aiosqlite.connect(DB_NAME) as db:
+        timestamp = datetime.now().isoformat()
+        try:
+            await db.execute(
+                "INSERT INTO videos VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (video_id, url, site, category, keyword, sent_to, timestamp)
+            )
+            await db.commit()
+        except aiosqlite.IntegrityError:
+            pass
+
+# ==========================================
+# SCRAPER
+# ==========================================
+class Scraper:
+    @staticmethod
+    async def get_soup(session, url):
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status == 200:
+                    return BeautifulSoup(await response.text(), 'html.parser')
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    async def scrape_site(session, site_url, target_keyword=None):
+        soup = await Scraper.get_soup(session, site_url)
+        if not soup: return []
+
+        videos = []
+        links = soup.find_all('a', href=True)
+        for link in links:
+            href = link['href']
+            title = link.get_text(strip=True)
+            if len(title) < 15: continue
+
+            if target_keyword and target_keyword.lower() not in title.lower():
+                continue
+
+            if href.startswith('/'):
+                from urllib.parse import urljoin
+                href = urljoin(site_url, href)
+
+            vid_id = href.split('?')[0].strip('/')
+            if not vid_id: continue
+
+            videos.append({
+                "video_id": vid_id, "url": href, "site": site_url,
+                "title": title, "category": target_keyword or "Auto-Scrape"
+            })
+            if len(videos) >= 50: break
+        return videos
+
+# ==========================================
+# BOT LOGIC
+# ==========================================
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+
+class ManualMode(StatesGroup):
+    selecting_category = State()
+    entering_quantity = State()
+
+auto_mode_enabled = True
+
+def get_category_keyboard():
+    buttons = [[InlineKeyboardButton(text=kw, callback_data=f"cat_{kw}")] for kw in KEYWORDS]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message, state: FSMContext):
+    await message.answer("Select a Category:", reply_markup=get_category_keyboard())
+    await state.set_state(ManualMode.selecting_category)
+
+@dp.callback_query(ManualMode.selecting_category)
+async def category_selected(callback: types.CallbackQuery, state: FSMContext):
+    keyword = callback.data.split("_")[1]
+    await state.update_data(selected_keyword=keyword)
+    await state.set_state(ManualMode.entering_quantity)
+    await callback.message.edit_text(f"Selected: **{keyword}**\n\nHow many videos?", parse_mode="Markdown")
+    await callback.answer()
+
+@dp.message(ManualMode.entering_quantity)
+async def quantity_entered(message: types.Message, state: FSMContext):
+    try:
+        quantity = int(message.text)
+        if quantity <= 0: raise ValueError
+    except ValueError:
+        await message.answer("Enter a valid number.")
+        return
+    data = await state.get_data()
+    keyword = data['selected_keyword']
+    await message.answer(f"Collecting {quantity} videos for '{keyword}'...")
+    await state.clear()
+    asyncio.create_task(run_manual_scrape(message.chat.id, keyword, quantity))
+
+@dp.message(Command("status"))
+async def cmd_status(message: types.Message):
+    status = "Running ✅" if auto_mode_enabled else "Stopped ⏸️"
+    await message.answer(f"Auto Mode: {status}")
+
+@dp.message(Command("auto"))
+async def cmd_auto(message: types.Message):
+    global auto_mode_enabled
+    if message.text == "/auto on":
+        auto_mode_enabled = True
+        await message.answer("Auto Mode ON.")
+    elif message.text == "/auto off":
+        auto_mode_enabled = False
+        await message.answer("Auto Mode OFF.")
+
+async def send_video(video, chat_id):
+    try:
+        caption = f"🔥 <b>{video['title']}</b>\n🔗 {video['url']}"
+        await bot.send_message(chat_id, caption, parse_mode="HTML")
+        return True
+    except Exception:
+        return False
+
+async def run_manual_scrape(user_id, keyword, quantity):
+    found = 0
+    async with aiohttp.ClientSession() as session:
+        for site in TARGET_SITES:
+            if found >= quantity: break
+            videos = await Scraper.scrape_site(session, site, target_keyword=keyword)
+            for video in videos:
+                if found >= quantity: break
+                if not await is_video_exists(video['video_id']):
+                    if await send_video(video, BULK_GROUP_ID):
+                        await save_video(video['video_id'], video['url'], video['site'], video['category'], keyword, "BULK")
+                        found += 1
+    await bot.send_message(user_id, f"✅ Done. Sent {found} videos.")
+
+async def auto_scrape_loop():
+    while True:
+        if auto_mode_enabled:
+            async with aiohttp.ClientSession() as session:
+                for site in TARGET_SITES:
+                    videos = await Scraper.scrape_site(session, site)
+                    for video in videos:
+                        if not await is_video_exists(video['video_id']):
+                            if await send_video(video, VIP_GROUP_ID):
+                                await save_video(video['video_id'], video['url'], site, "Latest", "N/A", "VIP")
+                        await asyncio.sleep(2)
+        await asyncio.sleep(AUTO_CHECK_INTERVAL)
+
+async def main():
+    await init_db()
+    asyncio.create_task(auto_scrape_loop())
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
