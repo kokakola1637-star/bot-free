@@ -3,6 +3,7 @@ import logging
 import aiosqlite
 import aiohttp
 import os
+import json
 from bs4 import BeautifulSoup
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
@@ -18,11 +19,10 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 VIP_GROUP_ID = int(os.getenv("VIP_GROUP_ID"))
 BULK_GROUP_ID = int(os.getenv("BULK_GROUP_ID"))
+# PASTE YOUR GIST RAW URL HERE
+GIST_RAW_URL = os.getenv("GIST_RAW_URL") 
 
-# Simple database path for free hosting
-DB_NAME = "bot_database.db"
-
-AUTO_CHECK_INTERVAL = 30 * 60  # 30 minutes
+AUTO_CHECK_INTERVAL = 30 * 60 
 
 KEYWORDS = [
     "desi homemade", "indian amateur sex", "real indian couple", "desi phone sex video",
@@ -46,10 +46,70 @@ TARGET_SITES = [
 ]
 
 # ==========================================
-# DATABASE
+# GIST DATABASE MANAGER
+# ==========================================
+class GistDB:
+    def __init__(self):
+        self.local_path = "bot_database.db"
+        self.github_token = os.getenv("GITHUB_TOKEN") # Needed to UPDATE the gist
+        self.gist_id = GIST_RAW_URL.split('/')[4] # Extract ID from URL roughly
+
+    async def sync_download(self):
+        """Download DB from Gist on startup"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(GIST_RAW_URL) as resp:
+                    if resp.status == 200:
+                        content = await resp.read()
+                        # Only write if file exists and has content, otherwise create fresh
+                        with open(self.local_path, "wb") as f:
+                            f.write(content)
+                        logging.info("Downloaded DB from Gist.")
+                    else:
+                        # Create empty if gist is new/empty
+                        open(self.local_path, "a").close()
+        except Exception as e:
+            logging.error(f"Failed to download DB: {e}")
+            open(self.local_path, "a").close()
+
+    async def sync_upload(self):
+        """Upload DB to Gist after save"""
+        if not self.github_token:
+            logging.warning("No GITHUB_TOKEN set. DB will not be saved to Gist!")
+            return
+
+        try:
+            with open(self.local_path, "rb") as f:
+                content = f.read()
+            
+            # Gist API call
+            url = f"https://api.github.com/gists/{self.gist_id}"
+            headers = {"Authorization": f"token {self.github_token}"}
+            data = {
+                "files": {
+                    "bot_database.db": {
+                        "content": content.decode('utf-8', errors='ignore') # Decode bytes for JSON payload
+                    }
+                }
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.patch(url, headers=headers, json=data) as resp:
+                    if resp.status == 200:
+                        logging.info("Saved DB to Gist.")
+                    else:
+                        logging.error(f"Failed to save DB: {resp.status}")
+        except Exception as e:
+            logging.error(f"Sync upload error: {e}")
+
+gist_db = GistDB()
+
+# ==========================================
+# DATABASE WRAPPER
 # ==========================================
 async def init_db():
-    async with aiosqlite.connect(DB_NAME) as db:
+    await gist_db.sync_download() # 1. Download from Gist
+    async with aiosqlite.connect(gist_db.local_path) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS videos (
                 video_id TEXT PRIMARY KEY,
@@ -62,15 +122,15 @@ async def init_db():
             )
         """)
         await db.commit()
-    logging.info("Database initialized.")
+    logging.info("Database ready.")
 
 async def is_video_exists(url_id: str) -> bool:
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with aiosqlite.connect(gist_db.local_path) as db:
         cursor = await db.execute("SELECT 1 FROM videos WHERE video_id = ?", (url_id,))
         return await cursor.fetchone() is not None
 
 async def save_video(video_id, url, site, category, keyword, sent_to):
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with aiosqlite.connect(gist_db.local_path) as db:
         timestamp = datetime.now().isoformat()
         try:
             await db.execute(
@@ -78,8 +138,13 @@ async def save_video(video_id, url, site, category, keyword, sent_to):
                 (video_id, url, site, category, keyword, sent_to, timestamp)
             )
             await db.commit()
+            # 2. Upload to Gist after every save (Rate limited, but works for small DB)
+            await gist_db.sync_upload()
         except aiosqlite.IntegrityError:
             pass
+
+# ... [SCRAPER, BOT LOGIC, and MAIN FUNCTIONS remain exactly the same as previous code] ...
+# I will include the scraper/bot logic below to make this a single copy-paste file
 
 # ==========================================
 # SCRAPER
