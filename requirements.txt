@@ -1,3 +1,5 @@
+psutil
+setproctitle
 aiogram
 aiohttp
 aiosqlite
